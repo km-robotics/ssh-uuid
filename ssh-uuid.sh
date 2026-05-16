@@ -160,6 +160,30 @@ function parse_short_flag {
 	done
 }
 
+# Decide whether a short-flag spec like '-p' or '-vt' or '-p22222' consumes
+# the next CLI token as its value (returns 0) or not (returns 1). The first
+# argument is the spec, the second is a string of option-taking flag letters.
+# Walks letters left-to-right: when an option-taking letter is found, any
+# letters that follow within the same spec are the (inline) value — so the
+# next token is NOT consumed; if the option-taking letter is the last one,
+# the value comes from the next token. Only consulted when an explicit
+# --balena-device-uuid was given (the default flow keeps the prior, simpler
+# parsing that relies on the UUID.balena regex to identify the hostname).
+function short_flag_consumes_next {
+	local spec="$1"
+	local arg_flags="$2"
+	local letters="${spec:1}"
+	local i
+	for (( i=0; i<${#letters}; i++ )); do
+		local c="${letters:i:1}"
+		if [[ "${arg_flags}" == *"${c}"* ]]; then
+			[ $((i+1)) -lt "${#letters}" ] && return 1
+			return 0
+		fi
+	done
+	return 1
+}
+
 # Parse the arguments and split them between option arguments and positional
 # arguments.
 # Note: the split happens at the first UUID.balena occurrence which is always
@@ -172,8 +196,54 @@ function parse_args {
 	SSUU_USER=''
 	SSUU_OPT_ARGS=()
 	SSUU_POS_ARGS=()
+
+	# Pre-scan for --balena-device-uuid (and -o-style equivalents) and strip
+	# those tokens out of `args` so the main loop sees a clean list. This
+	# makes the option order-independent relative to the hostname, and means
+	# the main loop's positional-split logic does not have to filter the
+	# tokens out of SSUU_POS_ARGS. A value carried over from the environment
+	# (e.g. inherited by an inner ssh-uuid invocation through
+	# 'scp -S ssh-uuid') is preserved if no flag overrides it.
+	local filtered=()
+	for (( i=0; i<nargs; i++ )); do
+		local pre_arg="${args[i]}"
+		if [ "${pre_arg}" = '--balena-device-uuid' ]; then
+			SSUU_BALENA_DEVICE_UUID="${args[++i]:-}"
+			continue
+		elif [[ "${pre_arg}" == -oBalenaDeviceUUID=* ]]; then
+			SSUU_BALENA_DEVICE_UUID="${pre_arg#-oBalenaDeviceUUID=}"
+			continue
+		elif [ "${pre_arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaDeviceUUID=* ]]; then
+			SSUU_BALENA_DEVICE_UUID="${args[++i]#BalenaDeviceUUID=}"
+			continue
+		fi
+		filtered+=("${pre_arg}")
+	done
+	args=("${filtered[@]}")
+	nargs=${#args[@]}
+	if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && \
+		! [[ "${SSUU_BALENA_DEVICE_UUID}" =~ ^([[:xdigit:]]{32}|[[:xdigit:]]{62})$ ]]; then
+		quit "Invalid balena device UUID: '${SSUU_BALENA_DEVICE_UUID}'. Expected 32 or 62 hex characters."
+	fi
+
+	# Option-taking short flags. Only consulted when SSUU_BALENA_DEVICE_UUID
+	# is set, where we must distinguish flag values from the connection
+	# target. The default flow keeps the prior, regex-based parsing.
+	local arg_flags
+	if [ "${SSUU_SCP}" = 1 ]; then
+		arg_flags='cFiloPSJ'
+	else
+		arg_flags='bcDEeFIiJLlmOopQRSWw'
+	fi
+
+	local skip_next=0
 	for (( i=0; i<nargs; i++ )); do
 		local arg="${args[i]}"
+		if [ "${skip_next}" = 1 ]; then
+			skip_next=0
+			SSUU_OPT_ARGS+=("${arg}")
+			continue
+		fi
 		if [ "${arg}" = '--help' ]; then
 			print_help_and_quit
 		fi
@@ -208,6 +278,26 @@ function parse_args {
 		if [ "${arg}" = '-o' ] && [[ "${args[i+1]:-}" == SocatSuppressCRLWarning=* ]]; then
 			[ "${args[++i]#SocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
 			continue
+		fi
+		# Explicit-UUID branch: when --balena-device-uuid is set, any non-flag
+		# arg is treated as the connection target (whatever the caller needs;
+		# it does not have to be UUID.balena). Checked before the regex
+		# patterns so the explicit option takes precedence if both are
+		# present.
+		#
+		# Only the ssh branch extracts the user@ prefix (to decide whether to
+		# inject `-l BALENA_USERNAME`). For scp we deliberately don't try to
+		# auto-prepend BALENA_USERNAME: the first non-flag arg might be a
+		# local path (e.g. `scp-uuid local.txt host:/dst`), and identifying
+		# which positional is the remote target is non-trivial without the
+		# UUID.balena anchor. Callers using explicit UUID with scp should
+		# write `user@host:path` themselves when they need a specific user.
+		if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && [ "${arg:0:1}" != '-' ]; then
+			if [ "${SSUU_SCP}" = 0 ] && [[ "${arg}" =~ ^(ssh://)?((.+)@) ]]; then
+				SSUU_USER="${BASH_REMATCH[3]}"
+			fi
+			SSUU_POS_ARGS=("${args[@]:i}")
+			break
 		fi
 		# Is arg a UUID.balena hostname specification?
 		# For ssh:
@@ -249,11 +339,18 @@ function parse_args {
 		fi
 		if [ "${arg:0:1}" = '-' ] && [ "${arg:1:1}" != '-' ]; then
 			parse_short_flag "${arg}"
+			# Track flags that consume the next token as their value. Limited
+			# to the explicit-UUID flow so existing behavior is unchanged.
+			if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && short_flag_consumes_next "${arg}" "${arg_flags}"; then
+				skip_next=1
+			fi
 		fi
 		SSUU_OPT_ARGS+=("${arg}")
 	done
 	if [ "${#SSUU_POS_ARGS[@]}" = 0 ]; then
-		if [ "${SSUU_SCP}" = '1' ]; then
+		if [ -n "${SSUU_BALENA_DEVICE_UUID}" ]; then
+			quit "Invalid command line (missing connection target)"
+		elif [ "${SSUU_SCP}" = '1' ]; then
 			quit "Invalid command line (missing 'UUID.balena:' remote host, including ':' character)"
 		else
 			quit "Invalid command line (missing 'UUID.balena' hostname)"
@@ -291,8 +388,14 @@ function run_ssh {
 	if [ -z "${SSUU_USER}" ] && [ -z "${SSUU_FLAG_l}" ] ; then
 		l_arg=('-l' "${BALENA_USERNAME}")
 	fi
+	# When --balena-device-uuid is set, the cmdline hostname is whatever the
+	# caller needs (e.g. an Eternal Terminal endpoint), so we cannot rely on
+	# ssh's %h substitution to identify the balena device for the tunnel.
+	# Hardcode the device hostname in the ProxyCommand instead.
+	local proxy_host='%h'
+	[ -n "${SSUU_BALENA_DEVICE_UUID}" ] && proxy_host="${SSUU_BALENA_DEVICE_UUID}.balena"
 	opt_args=(
-		-o "ProxyCommand='$0' do_proxy %h %p"
+		-o "ProxyCommand='$0' do_proxy ${proxy_host} %p"
 		-p 22222
 		"${l_arg[@]}"
 		"${t_arg[@]}"
@@ -371,9 +474,14 @@ function run_scp {
 		set -e
 		return "${status}"
 	fi
+	# See the matching comment in run_ssh: when --balena-device-uuid is set,
+	# the cmdline hostname is not necessarily a balena UUID, so the tunnel
+	# target must be hardcoded in the ProxyCommand.
+	local proxy_host='%h'
+	[ -n "${SSUU_BALENA_DEVICE_UUID}" ] && proxy_host="${SSUU_BALENA_DEVICE_UUID}.balena"
 	args=(
 		-P 22222
-		-o "ProxyCommand='$0' do_proxy %h %p"
+		-o "ProxyCommand='$0' do_proxy ${proxy_host} %p"
 		"${SSUU_OPT_ARGS[@]}"
 		"${SSUU_POS_ARGS[@]}"
 	)
@@ -465,8 +573,10 @@ function main {
 			SSUU_SCP='1'
 		fi
 		parse_args "$@"
-		# Propagate to the do_proxy sub-invocation (ssh's ProxyCommand).
+		# Propagate to the do_proxy sub-invocation (ssh's ProxyCommand) and
+		# to any inner ssh-uuid re-invocation (e.g. via 'scp -S ssh-uuid').
 		export SSUU_SOCAT_SUPPRESS_CRL_WARNING
+		export SSUU_BALENA_DEVICE_UUID
 		if [ "${SSUU_SCP}" = '1' ]; then
 			run_scp "$@"
 		else
