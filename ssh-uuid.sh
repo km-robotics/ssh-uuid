@@ -298,10 +298,12 @@ function run_ssh {
 		"${t_arg[@]}"
 		"${opt_args[@]}"
 	)
+	local ssh_bin
+	ssh_bin="$(find_next_in_path ssh)" || quit "Cannot find 'ssh' in PATH (other than this script)"
 	set +e
 	[ -n "${DEBUG}" ] && set -x
 	# shellcheck disable=SC2029
-	ssh "${opt_args[@]}" "${pos_args[@]}"
+	"${ssh_bin}" "${opt_args[@]}" "${pos_args[@]}"
 	{ local status="$?"; [ -n "${DEBUG}" ] && set +x; } 2>/dev/null
 	set -e
 	return "${status}"
@@ -355,6 +357,8 @@ $ scp-uuid -r ${uuid}.balena:/mnt/data/docker/volumes/<fleet-id>_data/_data/remo
 }
 
 function run_scp {
+	local scp_bin
+	scp_bin="$(find_next_in_path scp)" || quit "Cannot find 'scp' in PATH (other than this script)"
 	if [ -n "${SSUU_SERVICE}" ]; then
 		if [ -n "${SSUU_FLAG_S}" ]; then
 			quit "The '-S' and '--service' options cannot be used together"
@@ -362,7 +366,7 @@ function run_scp {
 		export SSUU_SERVICE
 		set +e
 		[ -n "${DEBUG}" ] && set -x
-		scp -S ssh-uuid "${SSUU_OPT_ARGS[@]}" "${SSUU_POS_ARGS[@]}"
+		"${scp_bin}" -S ssh-uuid "${SSUU_OPT_ARGS[@]}" "${SSUU_POS_ARGS[@]}"
 		{ local status="$?"; [ -n "${DEBUG}" ] && set +x; } 2>/dev/null
 		set -e
 		return "${status}"
@@ -375,7 +379,7 @@ function run_scp {
 	)
 	set +e
 	[ -n "${DEBUG}" ] && set -x
-	scp "${args[@]}"
+	"${scp_bin}" "${args[@]}"
 	{ local status="$?"; [ -n "${DEBUG}" ] && set +x; } 2>/dev/null
 	set -e
 	return "${status}"
@@ -428,6 +432,26 @@ function get_rand_port_num {
 
 function check_tool {
 	which "$1" &>/dev/null || quit "'$1' not found in PATH. Is it installed?"
+}
+
+# Locate the next executable named "$1" on PATH that is not this script
+# itself. Needed when ssh-uuid.sh is symlinked as 'ssh' (or 'scp') on PATH
+# — useful for tools that only honor a PATH-resolved 'ssh' — because our
+# own subprocess call would otherwise resolve back to the symlink and
+# recurse forever. The `-ef` test compares device/inode, so symlinks
+# resolving to the same target as $0 are detected.
+function find_next_in_path {
+	local name="$1"
+	local IFS=':'
+	local p
+	for p in $PATH; do
+		[ -n "${p}" ] || continue
+		[ -x "${p}/${name}" ] || continue
+		[ "${p}/${name}" -ef "$0" ] && continue
+		echo "${p}/${name}"
+		return 0
+	done
+	return 1
 }
 
 function main {
