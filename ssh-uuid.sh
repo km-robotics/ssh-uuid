@@ -181,6 +181,34 @@ function parse_args {
 			SSUU_SERVICE="${args[++i]}"
 			continue
 		fi
+		# Accept the --service value via a fake ssh -o option, so that ssh-uuid
+		# can be used as a drop-in replacement for ssh in contexts where only
+		# `-o` options can be customized on the caller side.
+		if [[ "${arg}" == -oBalenaService=* ]]; then
+			SSUU_SERVICE="${arg#-oBalenaService=}"
+			continue
+		fi
+		if [ "${arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaService=* ]]; then
+			SSUU_SERVICE="${args[++i]#BalenaService=}"
+			continue
+		fi
+		# Suppress the "this implementation does not check CRLs" message
+		# printed by recent socat versions on stderr. The warning is a real
+		# security notice (revoked certs will not be detected); only enable
+		# this when the user understands the trade-off and the message is
+		# getting in the way (e.g. noisy automation).
+		if [ "${arg}" = '--socat-suppress-crl-warning' ]; then
+			SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
+			continue
+		fi
+		if [[ "${arg}" == -oSocatSuppressCRLWarning=* ]]; then
+			[ "${arg#-oSocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
+			continue
+		fi
+		if [ "${arg}" = '-o' ] && [[ "${args[i+1]:-}" == SocatSuppressCRLWarning=* ]]; then
+			[ "${args[++i]#SocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
+			continue
+		fi
 		# Is arg a UUID.balena hostname specification?
 		# For ssh:
 		#   '[user@]UUID.balena'
@@ -363,7 +391,12 @@ function do_proxy {
 	mkdir -p "${BALENARC_DATA_DIRECTORY}" || quit "Cannot write to '${BALENARC_DATA_DIRECTORY}'"
 	echo -n "${BALENA_USERNAME}:${BALENA_TOKEN}" > "${PROXY_AUTH_FILE}" || quit "Cannot write to '${PROXY_AUTH_FILE}'"
 	[ -n "${DEBUG}" ] && set -x
-	socat "TCP-LISTEN:${SOCAT_PORT},bind=127.0.0.1" "OPENSSL:tunnel.balena-cloud.com:443,snihost=tunnel.balena-cloud.com" &
+	if [ -n "${SSUU_SOCAT_SUPPRESS_CRL_WARNING}" ]; then
+		# CRL-check warning suppressed by user request (see README).
+		socat "TCP-LISTEN:${SOCAT_PORT},bind=127.0.0.1" "OPENSSL:tunnel.balena-cloud.com:443,snihost=tunnel.balena-cloud.com" 2> >(grep -v "this implementation does not check CRLs" >&2) &
+	else
+		socat "TCP-LISTEN:${SOCAT_PORT},bind=127.0.0.1" "OPENSSL:tunnel.balena-cloud.com:443,snihost=tunnel.balena-cloud.com" &
+	fi
 	{ set +x; } 2>/dev/null
 	sleep 1 # poor man's wait for the background socat process to be ready
 	set +e
@@ -408,6 +441,8 @@ function main {
 			SSUU_SCP='1'
 		fi
 		parse_args "$@"
+		# Propagate to the do_proxy sub-invocation (ssh's ProxyCommand).
+		export SSUU_SOCAT_SUPPRESS_CRL_WARNING
 		if [ "${SSUU_SCP}" = '1' ]; then
 			run_scp "$@"
 		else

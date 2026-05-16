@@ -72,6 +72,18 @@ $ ssh-uuid --service my-service a123456abcdef123456abcdef1234567.balena cat /etc
 Debian GNU/Linux 11 \n \l
 ```
 
+The service name may also be specified through a fake `ssh -o` option, either
+as `-o BalenaService=<name>` or `-oBalenaService=<name>`. The option is
+intercepted by `ssh-uuid` and is not passed through to `ssh` itself. This is
+useful when `ssh-uuid` is used as a drop-in replacement for `ssh` from a
+caller (e.g. a third-party tool or git command) that does not allow any
+customization of the `ssh` command line other than `-o` options. Example:
+
+```sh
+$ ssh-uuid -oBalenaService=my-service a123456abcdef123456abcdef1234567.balena cat /etc/issue
+Debian GNU/Linux 11 \n \l
+```
+
 ## Remote command execution preserves the command's exit status code
 
 ```sh
@@ -438,6 +450,20 @@ Common errors:
 * `socat[1355] E parseopts(): unknown option "proxy-authorization-file"`  
   This error means that your system is using an outdate version of 'socat'.
   Update `socat` to version 1.7.4 or later as per Dependencies section.
+
+* `... W OpenSSL: this implementation does not check CRLs`  
+  Printed by recent versions of `socat` for the OpenSSL tunnel to balenaCloud.
+  This is a real security notice: `socat` does not consult Certificate
+  Revocation Lists, so a revoked server certificate would not be detected. The
+  message is normally harmless for short-lived interactive sessions, but it
+  can be noisy in automation. If — and only if — you understand and accept
+  the trade-off, the message can be suppressed by passing either the
+  `--socat-suppress-crl-warning` flag or the equivalent fake ssh option
+  `-oSocatSuppressCRLWarning=yes` (or `-o SocatSuppressCRLWarning=yes`). The
+  latter form is convenient when `ssh-uuid` is used as a drop-in replacement
+  for `ssh` and only `-o` options can be customized on the caller side.
+  Without the flag, `socat`'s stderr (including this warning) is passed
+  through unchanged.
 
 * `socat[25336] E CONNECT a123456abcdef123456abcdef1234567.balena:22222: Proxy Authorization Required`  
   Double check that the authentication session or API token is correct and has not expired.
