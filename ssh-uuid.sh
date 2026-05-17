@@ -197,24 +197,76 @@ function parse_args {
 	SSUU_OPT_ARGS=()
 	SSUU_POS_ARGS=()
 
-	# Pre-scan for --balena-device-uuid (and -o-style equivalents) and strip
-	# those tokens out of `args` so the main loop sees a clean list. This
-	# makes the option order-independent relative to the hostname, and means
-	# the main loop's positional-split logic does not have to filter the
-	# tokens out of SSUU_POS_ARGS. A value carried over from the environment
-	# (e.g. inherited by an inner ssh-uuid invocation through
-	# 'scp -S ssh-uuid') is preserved if no flag overrides it.
+	# Pre-scan: extract every ssh-uuid-specific ("fake") option no matter
+	# where it appears on the command line, and drop those tokens from
+	# `args` so the main loop only deals with real ssh/scp options and
+	# positionals. This is what makes the fake options order-independent
+	# relative to the hostname — important because the explicit-UUID path
+	# accepts the first non-flag arg as the connection target, so any fake
+	# option that came AFTER it would otherwise leak into SSUU_POS_ARGS and
+	# get forwarded to ssh/scp as part of the remote command. Values carried
+	# over from the environment (e.g. inherited by an inner ssh-uuid
+	# invocation through 'scp -S ssh-uuid') are preserved unless a flag
+	# overrides them.
 	local filtered=()
 	for (( i=0; i<nargs; i++ )); do
 		local pre_arg="${args[i]}"
+		if [ "${pre_arg}" = '--help' ]; then
+			print_help_and_quit
+		fi
+		# --service <name>: targets a balena service container instead of the
+		# host OS by wrapping the remote command in a balena-engine exec.
+		# Also accepted via a fake ssh -o option (-oBalenaService=<name> or
+		# -o BalenaService=<name>) so ssh-uuid can be used as a drop-in
+		# replacement for ssh in contexts where only `-o` options can be
+		# customized on the caller side.
+		if [ "${pre_arg}" = '--service' ]; then
+			SSUU_SERVICE="${args[++i]:-}"
+			continue
+		fi
+		if [[ "${pre_arg}" == -oBalenaService=* ]]; then
+			SSUU_SERVICE="${pre_arg#-oBalenaService=}"
+			continue
+		fi
+		if [ "${pre_arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaService=* ]]; then
+			SSUU_SERVICE="${args[++i]#BalenaService=}"
+			continue
+		fi
+		# --balena-device-uuid <uuid>: specifies the balena device UUID
+		# explicitly so the connection target on the cmdline can be anything
+		# the caller needs (the UUID.balena hostname is no longer required).
+		# Useful when the caller uses the SSH target for its own purposes
+		# (e.g. Eternal Terminal pointing at an etserver host) while the
+		# balena tunnel still has to route to a chosen device. Also accepted
+		# as the fake ssh option -oBalenaDeviceUUID=<uuid> / -o BalenaDeviceUUID=<uuid>.
 		if [ "${pre_arg}" = '--balena-device-uuid' ]; then
 			SSUU_BALENA_DEVICE_UUID="${args[++i]:-}"
 			continue
-		elif [[ "${pre_arg}" == -oBalenaDeviceUUID=* ]]; then
+		fi
+		if [[ "${pre_arg}" == -oBalenaDeviceUUID=* ]]; then
 			SSUU_BALENA_DEVICE_UUID="${pre_arg#-oBalenaDeviceUUID=}"
 			continue
-		elif [ "${pre_arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaDeviceUUID=* ]]; then
+		fi
+		if [ "${pre_arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaDeviceUUID=* ]]; then
 			SSUU_BALENA_DEVICE_UUID="${args[++i]#BalenaDeviceUUID=}"
+			continue
+		fi
+		# Suppress the "this implementation does not check CRLs" message
+		# printed by recent socat versions on stderr. The warning is a real
+		# security notice (revoked certs will not be detected); only enable
+		# this when the user understands the trade-off and the message is
+		# getting in the way (e.g. noisy automation). Also accepted as the
+		# fake ssh option -oSocatSuppressCRLWarning=yes / -o SocatSuppressCRLWarning=yes.
+		if [ "${pre_arg}" = '--socat-suppress-crl-warning' ]; then
+			SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
+			continue
+		fi
+		if [[ "${pre_arg}" == -oSocatSuppressCRLWarning=* ]]; then
+			[ "${pre_arg#-oSocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
+			continue
+		fi
+		if [ "${pre_arg}" = '-o' ] && [[ "${args[i+1]:-}" == SocatSuppressCRLWarning=* ]]; then
+			[ "${args[++i]#SocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
 			continue
 		fi
 		filtered+=("${pre_arg}")
@@ -242,41 +294,6 @@ function parse_args {
 		if [ "${skip_next}" = 1 ]; then
 			skip_next=0
 			SSUU_OPT_ARGS+=("${arg}")
-			continue
-		fi
-		if [ "${arg}" = '--help' ]; then
-			print_help_and_quit
-		fi
-		if [ "${arg}" = '--service' ]; then
-			SSUU_SERVICE="${args[++i]}"
-			continue
-		fi
-		# Accept the --service value via a fake ssh -o option, so that ssh-uuid
-		# can be used as a drop-in replacement for ssh in contexts where only
-		# `-o` options can be customized on the caller side.
-		if [[ "${arg}" == -oBalenaService=* ]]; then
-			SSUU_SERVICE="${arg#-oBalenaService=}"
-			continue
-		fi
-		if [ "${arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaService=* ]]; then
-			SSUU_SERVICE="${args[++i]#BalenaService=}"
-			continue
-		fi
-		# Suppress the "this implementation does not check CRLs" message
-		# printed by recent socat versions on stderr. The warning is a real
-		# security notice (revoked certs will not be detected); only enable
-		# this when the user understands the trade-off and the message is
-		# getting in the way (e.g. noisy automation).
-		if [ "${arg}" = '--socat-suppress-crl-warning' ]; then
-			SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
-			continue
-		fi
-		if [[ "${arg}" == -oSocatSuppressCRLWarning=* ]]; then
-			[ "${arg#-oSocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
-			continue
-		fi
-		if [ "${arg}" = '-o' ] && [[ "${args[i+1]:-}" == SocatSuppressCRLWarning=* ]]; then
-			[ "${args[++i]#SocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
 			continue
 		fi
 		# Explicit-UUID branch: when --balena-device-uuid is set, any non-flag
