@@ -309,11 +309,49 @@ function parse_args {
 		# which positional is the remote target is non-trivial without the
 		# UUID.balena anchor. Callers using explicit UUID with scp should
 		# write `user@host:path` themselves when they need a specific user.
+		#
+		# For ssh we also keep parsing past the host: callers (e.g. Eternal
+		# Terminal) often emit `host -oXxx=yyy ... cmd`, with real ssh
+		# options after the hostname. Standard ssh would treat those as part
+		# of the remote command, but in this wrapper, leaving them in
+		# SSUU_POS_ARGS means they'd be wrapped into the balena-engine exec
+		# payload when --service is in use. Sift them: anything starting with
+		# `-` (and any value an option-taking short flag pulls in) goes to
+		# SSUU_OPT_ARGS; the first remaining non-flag arg starts the actual
+		# remote command.
 		if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && [ "${arg:0:1}" != '-' ]; then
-			if [ "${SSUU_SCP}" = 0 ] && [[ "${arg}" =~ ^(ssh://)?((.+)@) ]]; then
+			if [ "${SSUU_SCP}" = 1 ]; then
+				SSUU_POS_ARGS=("${args[@]:i}")
+				break
+			fi
+			if [[ "${arg}" =~ ^(ssh://)?((.+)@) ]]; then
 				SSUU_USER="${BASH_REMATCH[3]}"
 			fi
-			SSUU_POS_ARGS=("${args[@]:i}")
+			local host="${arg}"
+			local cmd_start=$((i + 1))
+			local j post_skip=0
+			for (( j=cmd_start; j<nargs; j++ )); do
+				local jarg="${args[j]}"
+				if [ "${post_skip}" = 1 ]; then
+					post_skip=0
+					SSUU_OPT_ARGS+=("${jarg}")
+					cmd_start=$((j + 1))
+					continue
+				fi
+				if [ "${jarg:0:1}" != '-' ]; then
+					cmd_start=$j
+					break
+				fi
+				SSUU_OPT_ARGS+=("${jarg}")
+				cmd_start=$((j + 1))
+				if [ "${jarg:1:1}" != '-' ]; then
+					parse_short_flag "${jarg}"
+					if short_flag_consumes_next "${jarg}" "${arg_flags}"; then
+						post_skip=1
+					fi
+				fi
+			done
+			SSUU_POS_ARGS=("${host}" "${args[@]:cmd_start}")
 			break
 		fi
 		# Is arg a UUID.balena hostname specification?
