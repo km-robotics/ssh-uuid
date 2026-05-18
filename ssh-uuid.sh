@@ -80,20 +80,47 @@ function get_user_and_token {
 	fi
 	local cached_usr_file="${BALENARC_DATA_DIRECTORY}/cachedUsername"
 	if [[ ! -r "${cached_usr_file}" ]]; then
+		return
+	fi
+	# jq missing while the cached file exists isn't fatal here — see
+	# require_balena_auth, which surfaces the missing tool only when the
+	# balena tunnel is actually about to be used.
+	if ! command -v jq >/dev/null 2>&1; then
+		return
+	fi
+	local cached_username
+	local cached_token
+	cached_username="$(jq -r .username "${cached_usr_file}")"
+	cached_token="$(jq -r .token "${cached_usr_file}")"
+	BALENA_USERNAME="${BALENA_USERNAME:-"${cached_username}"}"
+	BALENA_TOKEN="${BALENA_TOKEN:-"${cached_token}"}"
+}
+
+# Mandatory-auth check. Called from code paths that actually need to talk to
+# balenaCloud (the proxy do_proxy uses, or any cmdline run that will inject
+# the ProxyCommand). With --no-balena-tunnel set, the wrapper does not touch
+# balenaCloud, so this is skipped.
+function require_balena_auth {
+	if [[ -n "${BALENA_USERNAME}" && -n "${BALENA_TOKEN}" ]]; then
+		return
+	fi
+	local cached_usr_file="${BALENARC_DATA_DIRECTORY}/cachedUsername"
+	if [[ ! -r "${cached_usr_file}" ]]; then
 		quit "\
 'BALENA_USERNAME' or 'BALENA_TOKEN' env vars not defined, and file
 '${cached_usr_file}' not found or not readable.
 Set the env vars as per README, or use the balena CLI 'login' and 'whoami'
 commands to ensure that file is created.
+(If you do not need the balena cloud tunnel — e.g. you reach the device
+over zerotier / tailscale / a private network — pass '--no-balena-tunnel'
+or '-oBalenaTunnel=no' to skip this requirement.)
 "
 	fi
+	# If we got here, the cached file exists but get_user_and_token couldn't
+	# parse it (missing jq, parse error, etc.). Surface the underlying
+	# requirement instead of staying silent.
 	check_tool jq
-	local cached_username
-	local cached_token 
-	cached_username="$(jq -r .username "${cached_usr_file}")"
-	cached_token="$(jq -r .token "${cached_usr_file}")"
-	BALENA_USERNAME="${BALENA_USERNAME:-"${cached_username}"}"
-	BALENA_TOKEN="${BALENA_TOKEN:-"${cached_token}"}"
+	quit "Cached balena credentials at '${cached_usr_file}' could not be read."
 }
 
 # This function will execute on the balenaOS host OS
@@ -269,6 +296,27 @@ function parse_args {
 			[ "${args[++i]#SocatSuppressCRLWarning=}" = 'yes' ] && SSUU_SOCAT_SUPPRESS_CRL_WARNING=1
 			continue
 		fi
+		# --no-balena-tunnel: bypass the balena cloud proxy entirely. The
+		# wrapper becomes a near-passthrough to ssh/scp — no ProxyCommand
+		# injection, no forced port 22222, no `-l BALENA_USERNAME` default,
+		# no BALENA_USERNAME/TOKEN requirement. The --service wrapping (and
+		# the rest of the parsing) still applies, so callers can still
+		# dispatch into a container via balena-engine exec when an
+		# alternative tunnel (zerotier, tailscale, LAN, etc.) already
+		# provides reach to the host OS SSH server. Also accepted as the
+		# fake ssh option -oBalenaTunnel=no / -o BalenaTunnel=no.
+		if [ "${pre_arg}" = '--no-balena-tunnel' ]; then
+			SSUU_NO_BALENA_TUNNEL=1
+			continue
+		fi
+		if [[ "${pre_arg}" == -oBalenaTunnel=* ]]; then
+			[ "${pre_arg#-oBalenaTunnel=}" = 'no' ] && SSUU_NO_BALENA_TUNNEL=1
+			continue
+		fi
+		if [ "${pre_arg}" = '-o' ] && [[ "${args[i+1]:-}" == BalenaTunnel=* ]]; then
+			[ "${args[++i]#BalenaTunnel=}" = 'no' ] && SSUU_NO_BALENA_TUNNEL=1
+			continue
+		fi
 		filtered+=("${pre_arg}")
 	done
 	args=("${filtered[@]}")
@@ -276,6 +324,9 @@ function parse_args {
 	if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && \
 		! [[ "${SSUU_BALENA_DEVICE_UUID}" =~ ^([[:xdigit:]]{32}|[[:xdigit:]]{62})$ ]]; then
 		quit "Invalid balena device UUID: '${SSUU_BALENA_DEVICE_UUID}'. Expected 32 or 62 hex characters."
+	fi
+	if [ -n "${SSUU_NO_BALENA_TUNNEL}" ] && [ -n "${SSUU_BALENA_DEVICE_UUID}" ]; then
+		quit "--no-balena-tunnel and --balena-device-uuid are mutually exclusive (one bypasses the balena tunnel, the other configures it)."
 	fi
 
 	# Option-taking short flags. Only consulted when SSUU_BALENA_DEVICE_UUID
@@ -296,9 +347,11 @@ function parse_args {
 			SSUU_OPT_ARGS+=("${arg}")
 			continue
 		fi
-		# Explicit-UUID branch: when --balena-device-uuid is set, any non-flag
-		# arg is treated as the connection target (whatever the caller needs;
-		# it does not have to be UUID.balena). Checked before the regex
+		# Non-UUID.balena hostname branch: fires when the caller has either
+		# set --balena-device-uuid (tunnel still on, but the hostname can be
+		# whatever) or --no-balena-tunnel (no tunnel, host is plain DNS / IP
+		# reachable through an alternative network). In both modes any
+		# non-flag arg is the connection target. Checked before the regex
 		# patterns so the explicit option takes precedence if both are
 		# present.
 		#
@@ -319,7 +372,8 @@ function parse_args {
 		# `-` (and any value an option-taking short flag pulls in) goes to
 		# SSUU_OPT_ARGS; the first remaining non-flag arg starts the actual
 		# remote command.
-		if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && [ "${arg:0:1}" != '-' ]; then
+		if { [ -n "${SSUU_BALENA_DEVICE_UUID}" ] || [ -n "${SSUU_NO_BALENA_TUNNEL}" ]; } \
+				&& [ "${arg:0:1}" != '-' ]; then
 			if [ "${SSUU_SCP}" = 1 ]; then
 				SSUU_POS_ARGS=("${args[@]:i}")
 				break
@@ -395,15 +449,18 @@ function parse_args {
 		if [ "${arg:0:1}" = '-' ] && [ "${arg:1:1}" != '-' ]; then
 			parse_short_flag "${arg}"
 			# Track flags that consume the next token as their value. Limited
-			# to the explicit-UUID flow so existing behavior is unchanged.
-			if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] && short_flag_consumes_next "${arg}" "${arg_flags}"; then
+			# to flows where the main loop accepts arbitrary non-flag args as
+			# the connection target (explicit UUID, or no-tunnel mode), so
+			# the default UUID.balena-regex flow is unchanged.
+			if { [ -n "${SSUU_BALENA_DEVICE_UUID}" ] || [ -n "${SSUU_NO_BALENA_TUNNEL}" ]; } \
+					&& short_flag_consumes_next "${arg}" "${arg_flags}"; then
 				skip_next=1
 			fi
 		fi
 		SSUU_OPT_ARGS+=("${arg}")
 	done
 	if [ "${#SSUU_POS_ARGS[@]}" = 0 ]; then
-		if [ -n "${SSUU_BALENA_DEVICE_UUID}" ]; then
+		if [ -n "${SSUU_BALENA_DEVICE_UUID}" ] || [ -n "${SSUU_NO_BALENA_TUNNEL}" ]; then
 			quit "Invalid command line (missing connection target)"
 		elif [ "${SSUU_SCP}" = '1' ]; then
 			quit "Invalid command line (missing 'UUID.balena:' remote host, including ':' character)"
@@ -440,18 +497,30 @@ function run_ssh {
 			"${remote_cmd[@]}"
 		)
 	fi
-	if [ -z "${SSUU_USER}" ] && [ -z "${SSUU_FLAG_l}" ] ; then
-		l_arg=('-l' "${BALENA_USERNAME}")
+	# In tunnel mode (the default), inject the ProxyCommand that routes
+	# through balenaCloud, force port 22222 (the balenaOS host SSH port),
+	# and default the login to BALENA_USERNAME if the caller did not pass
+	# one. With --no-balena-tunnel, none of this applies: the wrapper hands
+	# the user's args straight to ssh and only the --service wrapping (if
+	# any) takes effect.
+	local tunnel_args=()
+	if [ -z "${SSUU_NO_BALENA_TUNNEL}" ]; then
+		if [ -z "${SSUU_USER}" ] && [ -z "${SSUU_FLAG_l}" ] ; then
+			l_arg=('-l' "${BALENA_USERNAME}")
+		fi
+		# When --balena-device-uuid is set, the cmdline hostname is whatever
+		# the caller needs (e.g. an Eternal Terminal endpoint), so we cannot
+		# rely on ssh's %h substitution to identify the balena device for
+		# the tunnel. Hardcode the device hostname in the ProxyCommand.
+		local proxy_host='%h'
+		[ -n "${SSUU_BALENA_DEVICE_UUID}" ] && proxy_host="${SSUU_BALENA_DEVICE_UUID}.balena"
+		tunnel_args=(
+			-o "ProxyCommand='$0' do_proxy ${proxy_host} %p"
+			-p 22222
+		)
 	fi
-	# When --balena-device-uuid is set, the cmdline hostname is whatever the
-	# caller needs (e.g. an Eternal Terminal endpoint), so we cannot rely on
-	# ssh's %h substitution to identify the balena device for the tunnel.
-	# Hardcode the device hostname in the ProxyCommand instead.
-	local proxy_host='%h'
-	[ -n "${SSUU_BALENA_DEVICE_UUID}" ] && proxy_host="${SSUU_BALENA_DEVICE_UUID}.balena"
 	opt_args=(
-		-o "ProxyCommand='$0' do_proxy ${proxy_host} %p"
-		-p 22222
+		"${tunnel_args[@]}"
 		"${l_arg[@]}"
 		"${t_arg[@]}"
 		"${opt_args[@]}"
@@ -529,14 +598,18 @@ function run_scp {
 		set -e
 		return "${status}"
 	fi
-	# See the matching comment in run_ssh: when --balena-device-uuid is set,
-	# the cmdline hostname is not necessarily a balena UUID, so the tunnel
-	# target must be hardcoded in the ProxyCommand.
-	local proxy_host='%h'
-	[ -n "${SSUU_BALENA_DEVICE_UUID}" ] && proxy_host="${SSUU_BALENA_DEVICE_UUID}.balena"
+	# See the matching comment in run_ssh for tunnel vs. no-tunnel modes.
+	local tunnel_args=()
+	if [ -z "${SSUU_NO_BALENA_TUNNEL}" ]; then
+		local proxy_host='%h'
+		[ -n "${SSUU_BALENA_DEVICE_UUID}" ] && proxy_host="${SSUU_BALENA_DEVICE_UUID}.balena"
+		tunnel_args=(
+			-P 22222
+			-o "ProxyCommand='$0' do_proxy ${proxy_host} %p"
+		)
+	fi
 	args=(
-		-P 22222
-		-o "ProxyCommand='$0' do_proxy ${proxy_host} %p"
+		"${tunnel_args[@]}"
 		"${SSUU_OPT_ARGS[@]}"
 		"${SSUU_POS_ARGS[@]}"
 	)
@@ -618,8 +691,9 @@ function find_next_in_path {
 }
 
 function main {
-	get_user_and_token
+	get_user_and_token  # populates BALENA_USERNAME/TOKEN if available; silent if not
 	if [ "$1" = 'do_proxy' ]; then
+		require_balena_auth  # do_proxy always needs balenaCloud auth
 		shift
 		do_proxy "$@"
 	else
@@ -628,10 +702,17 @@ function main {
 			SSUU_SCP='1'
 		fi
 		parse_args "$@"
+		# Without --no-balena-tunnel, run_ssh/run_scp will inject the
+		# ProxyCommand and require balenaCloud auth — surface a clear error
+		# now if it is not configured.
+		if [ -z "${SSUU_NO_BALENA_TUNNEL}" ]; then
+			require_balena_auth
+		fi
 		# Propagate to the do_proxy sub-invocation (ssh's ProxyCommand) and
 		# to any inner ssh-uuid re-invocation (e.g. via 'scp -S ssh-uuid').
 		export SSUU_SOCAT_SUPPRESS_CRL_WARNING
 		export SSUU_BALENA_DEVICE_UUID
+		export SSUU_NO_BALENA_TUNNEL
 		if [ "${SSUU_SCP}" = '1' ]; then
 			run_scp "$@"
 		else

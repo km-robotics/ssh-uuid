@@ -57,6 +57,7 @@ ssh-uuid.sh
 | `--service <name>`                 | `-oBalenaService=<name>`                            |
 | `--balena-device-uuid <uuid>`      | `-oBalenaDeviceUUID=<uuid>`                         |
 | `--socat-suppress-crl-warning`     | `-oSocatSuppressCRLWarning=yes`                     |
+| `--no-balena-tunnel`               | `-oBalenaTunnel=no`                                 |
 
 The `-o`-style forms exist so the wrapper can be used as a drop-in
 replacement for ssh in tools (e.g. Eternal Terminal, git, rsync) that
@@ -67,6 +68,15 @@ hostname on the cmdline. With it set, any non-flag arg is accepted as the
 SSH connection target; the ProxyCommand hardcodes `<uuid>.balena` so the
 tunnel routes to the explicit device regardless of what ssh thinks it is
 connecting to.
+
+`--no-balena-tunnel` is the opposite: skip the balena cloud proxy
+entirely. The wrapper becomes a near-passthrough to ssh/scp (no
+ProxyCommand, no forced port 22222, no `-l BALENA_USERNAME` default, no
+BALENA_USERNAME/TOKEN requirement). `--service` still wraps remote
+commands via `balena-engine exec`. Useful when the device is reachable
+via another network (zerotier, tailscale, LAN) and only the
+container-dispatch part of the wrapper is wanted. Mutually exclusive
+with `--balena-device-uuid`.
 
 ## Key gotchas (when editing the script)
 

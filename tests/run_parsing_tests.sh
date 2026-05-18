@@ -77,12 +77,15 @@ FAKE_LEAKS=(
 	'-oBalenaService='
 	'-oBalenaDeviceUUID='
 	'-oSocatSuppressCRLWarning='
+	'-oBalenaTunnel='
 	'--service'
 	'--balena-device-uuid'
 	'--socat-suppress-crl-warning'
+	'--no-balena-tunnel'
 	'BalenaService='
 	'BalenaDeviceUUID='
 	'SocatSuppressCRLWarning='
+	'BalenaTunnel='
 )
 
 PASS=0
@@ -282,6 +285,72 @@ assert 'scp explicit UUID, fake mixed' \
 assert 'scp classic UUID.balena (no --service)' \
 	"${UUID32}.balena:/dst" '' -- \
 	scp-uuid local.txt "${UUID32}.balena:/dst"
+
+echo '--- --no-balena-tunnel (skip balena cloud proxy) ---'
+# Without the tunnel, NONE of these tunnel-mode tokens should appear:
+# the ProxyCommand, the forced -p 22222 / -P 22222, or the auto-injected
+# `-l BALENA_USERNAME`. The user's args otherwise pass through unchanged.
+NO_TUNNEL_FORBIDDEN='ProxyCommand=;-p 22222;-P 22222;-l;testuser'
+
+assert '--no-balena-tunnel + --service: ProxyCommand etc. skipped' \
+	'remote__main;svc;myhost' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid --no-balena-tunnel --service svc myhost echo hi
+
+assert '--no-balena-tunnel (no --service): bare passthrough' \
+	'myhost;echo;hi' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid --no-balena-tunnel myhost echo hi
+
+assert '-oBalenaTunnel=no equivalent' \
+	'myhost;echo' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid -oBalenaTunnel=no myhost echo hi
+
+assert '-o BalenaTunnel=no split form' \
+	'myhost;echo' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid -o BalenaTunnel=no myhost echo hi
+
+assert '--no-balena-tunnel + custom -p preserved (no forced 22222)' \
+	'-p;2022;myhost;echo' '-p 22222' -- \
+	ssh-uuid --no-balena-tunnel -p 2022 myhost echo
+
+assert '--no-balena-tunnel + user@host: user untouched' \
+	'jakub2@myhost' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid --no-balena-tunnel jakub2@myhost echo
+
+assert '--no-balena-tunnel + bare host: no -l injection' \
+	'myhost' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid --no-balena-tunnel myhost echo
+
+assert '--no-balena-tunnel: real -o options after host still sifted to opts' \
+	'-oStrictHostKeyChecking=no;myhost;echo' "${NO_TUNNEL_FORBIDDEN}" -- \
+	ssh-uuid --no-balena-tunnel myhost -oStrictHostKeyChecking=no echo
+
+assert 'scp --no-balena-tunnel: no ProxyCommand / -P 22222' \
+	'local.txt;myhost:/dst' "${NO_TUNNEL_FORBIDDEN}" -- \
+	scp-uuid --no-balena-tunnel local.txt myhost:/dst
+
+# Without BALENA_USERNAME/TOKEN the tunnel mode would error out; no-tunnel
+# mode must succeed and produce normal ssh argv.
+nt_out="$(env -u BALENA_USERNAME -u BALENA_TOKEN ssh-uuid --no-balena-tunnel myhost echo hi 2>&1 || true)"
+if printf '%s' "${nt_out}" | grep -q 'ssh-called' && \
+   ! printf '%s' "${nt_out}" | grep -q "ERROR"; then
+	PASS=$((PASS+1))
+	printf '  PASS  --no-balena-tunnel works without BALENA_USERNAME/TOKEN\n'
+else
+	FAIL=$((FAIL+1))
+	FAILED_LABELS+=('--no-balena-tunnel works without BALENA_USERNAME/TOKEN')
+	printf '  FAIL  --no-balena-tunnel without BALENA_*: out=%s\n' "${nt_out}"
+fi
+
+# Mutually exclusive with --balena-device-uuid: must error clearly.
+conflict_out="$(ssh-uuid --no-balena-tunnel --balena-device-uuid "${UUID32}" host 2>&1 || true)"
+if printf '%s' "${conflict_out}" | grep -q 'mutually exclusive'; then
+	PASS=$((PASS+1))
+	printf '  PASS  --no-balena-tunnel + --balena-device-uuid rejected\n'
+else
+	FAIL=$((FAIL+1))
+	FAILED_LABELS+=('--no-balena-tunnel + --balena-device-uuid rejected')
+	printf '  FAIL  mutual-exclusion check missing -- out: %s\n' "${conflict_out}"
+fi
 
 echo '--- UUID validation ---'
 val_out="$(ssh-uuid --balena-device-uuid not-a-uuid host 2>&1 || true)"
