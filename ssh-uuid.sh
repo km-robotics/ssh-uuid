@@ -621,6 +621,33 @@ function run_scp {
 	return "${status}"
 }
 
+# Filter socat's stderr (stdin -> stdout) in do_proxy. Drops the messages
+# caused by the normal tunnel teardown, which are noise for the user: the
+# foreground socat writing to ssh after ssh already closed the pipe
+# ("E write(1, ...): Broken pipe", a race on logout) and the background
+# socat being stopped by do_proxy ("W exiting on signal 15"). These are kept
+# with DEBUG set. Also drops the CRL-check warning when suppressed by user
+# request (see README), regardless of DEBUG.
+function filter_socat_stderr {
+	local patterns=()
+	if [ -z "${DEBUG}" ]; then
+		patterns+=('socat\[[0-9]+\] E write\(1, .*\): Broken pipe$')
+		patterns+=('socat\[[0-9]+\] W exiting on signal 15$')
+	fi
+	if [ -n "${SSUU_SOCAT_SUPPRESS_CRL_WARNING}" ]; then
+		patterns+=('this implementation does not check CRLs')
+	fi
+	if [ "${#patterns[@]}" = 0 ]; then
+		cat
+		return
+	fi
+	local grep_args=() p
+	for p in "${patterns[@]}"; do
+		grep_args+=(-e "${p}")
+	done
+	grep --line-buffered -v -E "${grep_args[@]}"
+}
+
 # Run socat
 function do_proxy {
 	local TARGET_HOST="$1"
@@ -631,17 +658,12 @@ function do_proxy {
 	mkdir -p "${BALENARC_DATA_DIRECTORY}" || quit "Cannot write to '${BALENARC_DATA_DIRECTORY}'"
 	echo -n "${BALENA_USERNAME}:${BALENA_TOKEN}" > "${PROXY_AUTH_FILE}" || quit "Cannot write to '${PROXY_AUTH_FILE}'"
 	[ -n "${DEBUG}" ] && set -x
-	if [ -n "${SSUU_SOCAT_SUPPRESS_CRL_WARNING}" ]; then
-		# CRL-check warning suppressed by user request (see README).
-		socat "TCP-LISTEN:${SOCAT_PORT},bind=127.0.0.1" "OPENSSL:tunnel.balena-cloud.com:443,snihost=tunnel.balena-cloud.com" 2> >(grep -v "this implementation does not check CRLs" >&2) &
-	else
-		socat "TCP-LISTEN:${SOCAT_PORT},bind=127.0.0.1" "OPENSSL:tunnel.balena-cloud.com:443,snihost=tunnel.balena-cloud.com" &
-	fi
+	socat "TCP-LISTEN:${SOCAT_PORT},bind=127.0.0.1" "OPENSSL:tunnel.balena-cloud.com:443,snihost=tunnel.balena-cloud.com" 2> >(filter_socat_stderr >&2) &
 	{ set +x; } 2>/dev/null
 	sleep 1 # poor man's wait for the background socat process to be ready
 	set +e
 	[ -n "${DEBUG}" ] && set -x
-	socat - "PROXY:127.0.0.1:${TARGET_HOST}:${TARGET_PORT},proxyport=${SOCAT_PORT},proxy-authorization-file=${PROXY_AUTH_FILE}"
+	socat - "PROXY:127.0.0.1:${TARGET_HOST}:${TARGET_PORT},proxyport=${SOCAT_PORT},proxy-authorization-file=${PROXY_AUTH_FILE}" 2> >(filter_socat_stderr >&2)
 	{ local status="$?"; [ -n "${DEBUG}" ] && set +x; } 2>/dev/null
 	set -e
 	local pid
